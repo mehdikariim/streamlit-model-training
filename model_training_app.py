@@ -467,8 +467,8 @@ def main():
                             mime="application/zip"
                         )
 
-    else:
-        st.info("Please upload a CSV or XLSX file to begin.")
+                   else:
+                        st.info("Please upload a CSV or XLSX file to begin.")
 
 if __name__ == "__main__":
     main()
