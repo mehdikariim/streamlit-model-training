@@ -1,11 +1,13 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-import io
-import joblib
-import zipfile
-from pathlib import Path
+import os
+import logging
 from itertools import combinations
+from pathlib import Path
+import joblib
+from io import BytesIO
+import zipfile
 
 from sklearn.model_selection import train_test_split, cross_val_score, GridSearchCV
 from sklearn.linear_model import LinearRegression, Ridge, Lasso
@@ -14,89 +16,105 @@ from sklearn.pipeline import Pipeline
 from sklearn.metrics import r2_score, mean_squared_error, mean_absolute_error
 from statsmodels.stats.outliers_influence import variance_inflation_factor
 
-# ===================
-# Utility Functions
-# ===================
+# -----------------------------------------------------------------------------
+# 1. Define your utility functions (most of your existing code)
+# -----------------------------------------------------------------------------
 
-def load_and_clean_data(df, target_column='pic50'):
+def load_and_clean_data(df, target_column='pic50', exclude_columns=None, numeric_columns=None):
     """
-    Load and clean the dataset from a DataFrame, focusing on numeric columns
-    and returning X, y for modeling.
+    Clean the dataset, excluding specified columns, converting columns to numeric, etc.
+    Instead of loading from file_path, we now directly accept a DataFrame (df).
     """
-    df = df.copy()
-    # Ensure columns are stripped of whitespace
-    df.columns = df.columns.str.strip()
-    
-    # Automatically select numeric columns
-    numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
-    
-    # If target column is not numeric, try converting
-    if target_column in df.columns and target_column not in numeric_cols:
-        df[target_column] = df[target_column].astype(str).str.replace(',', '.', regex=False).str.replace(' ', '', regex=False)
-        df[target_column] = pd.to_numeric(df[target_column], errors='coerce')
-        numeric_cols.append(target_column)
+    try:
+        # Strip any trailing or leading spaces from column names
+        df.columns = df.columns.str.strip()
 
-    # Drop rows with NA in the numeric columns
-    df = df.dropna(subset=numeric_cols)
-    
-    # Separate X and y
-    if target_column in df.columns:
-        X = df.drop(columns=[target_column])
-        y = df[target_column]
-    else:
-        # If the target column is not present, return the entire dataframe as X, and None for y
-        X = df
-        y = None
-    
-    return X, y
+        # Exclude specified columns
+        if exclude_columns:
+            df = df.drop(columns=exclude_columns, errors='ignore')
+        
+        # Automatically select numeric columns if not specified
+        if numeric_columns is None:
+            numeric_columns = df.select_dtypes(include=[np.number]).columns.tolist()
+
+        # Ensure target column is included in numeric_columns
+        if target_column not in numeric_columns:
+            numeric_columns.append(target_column)
+
+        # Clean numeric columns: replace commas with dots, remove spaces, convert to float
+        data_cleaned = df.copy()
+        for col in numeric_columns:
+            data_cleaned[col] = data_cleaned[col].astype(str).str.replace(',', '.', regex=False).str.replace(' ', '', regex=False)
+            data_cleaned[col] = pd.to_numeric(data_cleaned[col], errors='coerce')
+        
+        # Drop rows with NA in numeric columns including target
+        data_cleaned = data_cleaned.dropna(subset=numeric_columns)
+
+        # Separate features and target
+        X = data_cleaned.drop(columns=[target_column])
+        y = data_cleaned[target_column]
+
+        return X, y
+    except Exception as e:
+        st.error(f"Error in load_and_clean_data: {e}")
+        raise
 
 def remove_highly_correlated_features(X, threshold=0.85):
     """
     Remove features that have a correlation higher than the specified threshold.
     """
-    corr_matrix = X.corr().abs()
-    upper = corr_matrix.where(np.triu(np.ones(corr_matrix.shape), k=1).astype(bool))
-    to_drop = [column for column in upper.columns if any(upper[column] > threshold)]
-    X_reduced = X.drop(columns=to_drop)
-    return X_reduced
+    try:
+        corr_matrix = X.corr().abs()
+        upper = corr_matrix.where(np.triu(np.ones(corr_matrix.shape), k=1).astype(bool))
+        to_drop = [column for column in upper.columns if any(upper[column] > threshold)]
+        X_reduced = X.drop(columns=to_drop)
+        return X_reduced
+    except Exception as e:
+        st.error(f"Error in remove_highly_correlated_features: {e}")
+        raise
 
 def calculate_vif(X):
     """
-    Calculate Variance Inflation Factor (VIF) for each feature.
+    Calculate Variance Inflation Factor (VIF) for each feature in the dataframe.
     """
-    scaler = StandardScaler()
-    X_scaled = scaler.fit_transform(X)
-    vif = [variance_inflation_factor(X_scaled, i) for i in range(X_scaled.shape[1])]
-    vif_df = pd.DataFrame({'Feature': X.columns, 'VIF': vif})
-    return vif_df
+    try:
+        X_scaled = StandardScaler().fit_transform(X)
+        vif = [variance_inflation_factor(X_scaled, i) for i in range(X_scaled.shape[1])]
+        vif_df = pd.DataFrame({'Feature': X.columns, 'VIF': vif})
+        return vif_df
+    except Exception as e:
+        st.error(f"Error in calculate_vif: {e}")
+        raise
 
 def select_features_via_vif(X, threshold=5.0):
     """
-    Iteratively remove features with VIF greater than threshold.
+    Iteratively remove features with VIF greater than the threshold.
     """
-    X_selected = X.copy()
-    while True:
-        vif_df = calculate_vif(X_selected)
-        max_vif = vif_df['VIF'].max()
-        if max_vif > threshold:
-            # Drop the feature with the highest VIF
-            feature_to_drop = vif_df.loc[vif_df['VIF'] == max_vif, 'Feature'].values[0]
-            X_selected = X_selected.drop(columns=[feature_to_drop])
-        else:
-            break
-    return X_selected
+    try:
+        X_selected = X.copy()
+        while True:
+            vif_df = calculate_vif(X_selected)
+            max_vif = vif_df['VIF'].max()
+            if max_vif > threshold:
+                feature_to_drop = vif_df.loc[vif_df['VIF'] == max_vif, 'Feature'].values[0]
+                X_selected = X_selected.drop(columns=[feature_to_drop])
+            else:
+                break
+        return X_selected
+    except Exception as e:
+        st.error(f"Error in select_features_via_vif: {e}")
+        raise
 
 def create_pipeline(model):
     """
-    Create a pipeline with scaling + model.
+    Create a machine learning pipeline with scaling and the specified model.
     """
-    steps = [('scaler', StandardScaler()),
-             ('model', model)]
+    steps = [('scaler', StandardScaler()), ('model', model)]
     return Pipeline(steps)
 
 def get_param_grid(model_name):
     """
-    Hyperparameter grids for different models.
+    Define hyperparameter grids for different models.
     """
     param_grids = {
         'LinearRegression': {},
@@ -107,269 +125,350 @@ def get_param_grid(model_name):
 
 def evaluate_model(model, X_train, y_train, X_test, y_test):
     """
-    Train and evaluate the model, return metrics.
+    Train the model and evaluate it using various metrics.
     """
-    model.fit(X_train, y_train)
-   
-    y_pred_train = model.predict(X_train)
-    y_pred_test = model.predict(X_test)
+    try:
+        # Train the model
+        model.fit(X_train, y_train)
 
-    # Metrics
-    r2_train = r2_score(y_train, y_pred_train)
-    r2_test = r2_score(y_test, y_pred_test)
-    mse_test = mean_squared_error(y_test, y_pred_test)
-    rmse_test = np.sqrt(mse_test)
-    mae_test = mean_absolute_error(y_test, y_pred_test)
-   
-    # Adjusted R²
-    n = X_test.shape[0]
-    p = X_test.shape[1]
-    if n > p + 1:
-        adj_r2_test = 1 - (1 - r2_test) * (n - 1) / (n - p - 1)
-    else:
-        adj_r2_test = None
-   
-    # Cross-validation on combined dataset
-    cv_scores = cross_val_score(model, pd.concat([X_train, X_test]),
-                                pd.concat([y_train, y_test]), cv=5, scoring='r2')
-    cv_r2 = np.mean(cv_scores)
-   
-    # VIF (after scaling)
-    scaler = model.named_steps['scaler']
-    X_train_scaled = scaler.transform(X_train)
-    vif = [variance_inflation_factor(X_train_scaled, i) for i in range(X_train_scaled.shape[1])]
-    vif_df = pd.DataFrame({'Feature': X_train.columns, 'VIF': vif})
-   
-    # Equation (for linear models)
-    if hasattr(model.named_steps['model'], 'coef_'):
-        coefficients = model.named_steps['model'].coef_
-        intercept = model.named_steps['model'].intercept_
-        eq_terms = []
-        for coef, feat in zip(coefficients, X_train.columns):
-            eq_terms.append(f"{coef:.3f}*{feat}")
-        equation = f"{intercept:.3f} + " + " + ".join(eq_terms)
-    else:
-        equation = "N/A"
-   
-    metrics = {
-        'R2_train': r2_train,
-        'R2_test': r2_test,
-        'Adjusted_R2': adj_r2_test,
-        'MSE': mse_test,
-        'RMSE': rmse_test,
-        'MAE': mae_test,
-        'CV_R2': cv_r2,
-        'VIF': vif_df,
-        'Equation': equation
-    }
-   
-    return metrics
+        # Predictions
+        y_pred_train = model.predict(X_train)
+        y_pred_test = model.predict(X_test)
+
+        # Calculate metrics
+        r2_train = r2_score(y_train, y_pred_train)
+        r2_test = r2_score(y_test, y_pred_test)
+        mse_test = mean_squared_error(y_test, y_pred_test)
+        rmse_test = np.sqrt(mse_test)
+        mae_test = mean_absolute_error(y_test, y_pred_test)
+
+        # Adjusted R²
+        n = X_test.shape[0]
+        p = X_test.shape[1]
+        if n > p + 1:
+            adj_r2_test = 1 - (1 - r2_test) * (n - 1) / (n - p - 1)
+        else:
+            adj_r2_test = None
+
+        # Cross-Validation
+        cv_scores = cross_val_score(model, pd.concat([X_train, X_test]), pd.concat([y_train, y_test]), cv=5, scoring='r2', n_jobs=-1)
+        cv_r2 = np.mean(cv_scores)
+
+        # VIF Calculation (after scaling)
+        scaler = model.named_steps['scaler']
+        X_train_scaled = scaler.transform(X_train)
+        vif = [variance_inflation_factor(X_train_scaled, i) for i in range(X_train_scaled.shape[1])]
+        vif_df = pd.DataFrame({'Feature': X_train.columns, 'VIF': vif})
+
+        # Extract equation for linear models
+        if hasattr(model.named_steps['model'], 'coef_'):
+            coefficients = model.named_steps['model'].coef_
+            intercept = model.named_steps['model'].intercept_
+            equation_terms = [f"{coef:.3f}*{feat}" for coef, feat in zip(coefficients, X_train.columns)]
+            equation = " + ".join(equation_terms)
+            equation = f"{intercept:.3f} + " + equation
+        else:
+            equation = "N/A"
+
+        metrics = {
+            'R2_train': r2_train,
+            'R2_test': r2_test,
+            'Adjusted_R2': adj_r2_test,
+            'MSE': mse_test,
+            'RMSE': rmse_test,
+            'MAE': mae_test,
+            'CV_R2': cv_r2,
+            'VIF': vif_df,
+            'Equation': equation
+        }
+
+        return metrics
+    except Exception as e:
+        st.error(f"Error in evaluate_model: {e}")
+        return None
 
 def train_and_select_models(
-    X, y,
-    models,
-    param_grids,
-    # Predefined thresholds (minimal user input):
-    corr_threshold=0.85,
-    vif_threshold=5.0,
-    adjusted_r2_threshold=0.5,
-    cv_r2_threshold=0.6,
-    min_features=3,
-    max_features=5,
-    max_models=5
+    X, y, models, param_grids, 
+    min_features=3, max_features=5, vif_threshold=5.0,
+    adjusted_r2_threshold=0.5, cv_r2_threshold=0.6, max_models=10
 ):
     """
-    Train multiple models with different feature combinations and select best ones.
+    Train multiple models with different feature combinations and select the best ones based on metrics.
     """
     best_models = []
     all_combinations = []
 
-    # Generate all combinations of features between min_features and max_features
+    # Generate all feature combinations
     for n in range(min_features, max_features + 1):
         all_combinations += list(combinations(X.columns, n))
-    
-    total_combos = len(all_combinations) * len(models)
-    st.write(f"Trying {total_combos} total combinations...")
 
-    progress_count = 0
-    progress_bar = st.progress(progress_count / total_combos)
+    # Progress bar
+    total_iterations = len(all_combinations) * len(models)
+    progress_bar = st.progress(0)
+    iteration_count = 0
 
     for combo in all_combinations:
-        # Subset the data to these features
         X_subset = X[list(combo)]
-       
-        # Train/Test Split
+
+        # Split the data
         X_train, X_test, y_train, y_test = train_test_split(
             X_subset, y, test_size=0.2, random_state=42
         )
-       
-        # Calculate VIF on training set
-        vif_df = calculate_vif(X_train)
-        if vif_df['VIF'].max() > vif_threshold:
-            # Skip this combination
-            progress_count += len(models)
-            progress_bar.progress(progress_count / total_combos)
+
+        # Calculate initial VIF to skip highly collinear feature sets
+        try:
+            vif_initial = calculate_vif(X_train)
+            if vif_initial['VIF'].max() > vif_threshold:
+                # Update progress
+                iteration_count += len(models)
+                progress_bar.progress(min(iteration_count / total_iterations, 1.0))
+                continue  # Skip this feature combination
+        except:
+            iteration_count += len(models)
+            progress_bar.progress(min(iteration_count / total_iterations, 1.0))
             continue
-       
-        # For each model
+
         for model_name, model in models.items():
-            # Create pipeline
             pipeline = create_pipeline(model)
             param_grid = param_grids.get(model_name, {})
-            
-            # Perform GridSearch if needed
+
+            # If hyperparameters are to be tuned
             if param_grid:
-                grid = GridSearchCV(pipeline, param_grid, cv=5, scoring='r2')
+                grid = GridSearchCV(
+                    pipeline,
+                    param_grid,
+                    cv=5,
+                    scoring='r2',
+                    n_jobs=-1
+                )
                 grid.fit(X_train, y_train)
                 best_pipeline = grid.best_estimator_
-                best_params = grid.best_params_
             else:
-                # No hyperparameters, just fit
-                pipeline.fit(X_train, y_train)
-                best_pipeline = pipeline
-                best_params = {}
-           
-            # Evaluate the best pipeline
+                best_pipeline = pipeline.fit(X_train, y_train)
+
+            # Evaluate the model
             metrics = evaluate_model(best_pipeline, X_train, y_train, X_test, y_test)
-            
-            # Check if it meets our selection thresholds
-            if metrics['Adjusted_R2'] is not None and metrics['Adjusted_R2'] >= adjusted_r2_threshold:
-                if metrics['CV_R2'] >= cv_r2_threshold:
+
+            if metrics:
+                # Apply selection criteria
+                if (metrics['Adjusted_R2'] is not None and
+                    metrics['Adjusted_R2'] >= adjusted_r2_threshold and
+                    metrics['CV_R2'] >= cv_r2_threshold):
+                    
+                    # Check VIF
                     if (metrics['VIF']['VIF'] <= vif_threshold).all():
-                        # Save it
                         best_models.append({
                             'Model': model_name,
                             'Features': combo,
-                            'Best Params': best_params,
-                            'Metrics': metrics,
+                            'Best Parameters': grid.best_params_ if param_grid else {},
+                            'R2_train': metrics['R2_train'],
+                            'R2_test': metrics['R2_test'],
+                            'Adjusted_R2': metrics['Adjusted_R2'],
+                            'MSE': metrics['MSE'],
+                            'RMSE': metrics['RMSE'],
+                            'MAE': metrics['MAE'],
+                            'CV_R2': metrics['CV_R2'],
+                            'VIF': metrics['VIF'],
+                            'Equation': metrics['Equation'],
                             'Best Estimator': best_pipeline,
                             'X_train': X_train,
-                            'y_train': y_train,
                             'X_test': X_test,
+                            'y_train': y_train,
                             'y_test': y_test
                         })
+                        
+                        # If enough models are found
                         if len(best_models) >= max_models:
-                            # If we've collected enough models, return early
-                            return sorted(best_models, key=lambda x: x['Metrics']['CV_R2'], reverse=True)
+                            iteration_count += 1
+                            progress_bar.progress(min(iteration_count / total_iterations, 1.0))
+                            break
+            
+            iteration_count += 1
+            progress_bar.progress(min(iteration_count / total_iterations, 1.0))
 
-            progress_count += 1
-            progress_bar.progress(progress_count / total_combos)
+        if len(best_models) >= max_models:
+            break
 
-    # Sort by CV_R2 descending
-    best_models_sorted = sorted(best_models, key=lambda x: x['Metrics']['CV_R2'], reverse=True)
+    # Sort the best models based on CV_R2
+    best_models_sorted = sorted(best_models, key=lambda x: x['CV_R2'], reverse=True)
+
     return best_models_sorted
 
+def save_model_details_to_zip(best_models):
+    """
+    Save the best models' details, train/test datasets, and the models
+    into an in-memory zip file, returning the BytesIO object for download.
+    """
+    # In-memory buffer
+    zip_buffer = BytesIO()
+    
+    with zipfile.ZipFile(zip_buffer, "w") as zf:
+        # Prepare text details
+        details_content = []
+        for i, model in enumerate(best_models):
+            details_content.append(f"Model {i+1} Details:\n")
+            details_content.append(f"Model: {model['Model']}\n")
+            details_content.append(f"Features: {model['Features']}\n")
+            details_content.append(f"Best Parameters: {model['Best Parameters']}\n")
+            details_content.append(f"Training R²: {model['R2_train']:.4f}\n")
+            details_content.append(f"Test R²: {model['R2_test']:.4f}\n")
+            details_content.append(f"Adjusted R²: {model['Adjusted_R2']:.4f}\n")
+            details_content.append(f"MSE: {model['MSE']:.4f}\n")
+            details_content.append(f"RMSE: {model['RMSE']:.4f}\n")
+            details_content.append(f"MAE: {model['MAE']:.4f}\n")
+            details_content.append(f"CV R²: {model['CV_R2']:.4f}\n")
+            details_content.append("VIF:\n")
+            details_content.append(model['VIF'].to_string(index=False))
+            details_content.append("\n")
+            details_content.append(f"Equation: {model['Equation']}\n")
+            details_content.append("\n" + "-"*80 + "\n\n")
 
-# ===================
-# Streamlit Interface
-# ===================
+        # Write details file
+        details_filename = "best_models_details.txt"
+        zf.writestr(details_filename, "\n".join(details_content))
+
+        # Save train/test datasets and models
+        for i, model in enumerate(best_models):
+            # CSV for train
+            X_train, y_train = model['X_train'], model['y_train']
+            train_data = pd.concat([X_train, y_train], axis=1)
+            train_csv = train_data.to_csv(index=False)
+            zf.writestr(f"data_model_{i+1}_train.csv", train_csv)
+
+            # CSV for test
+            X_test, y_test = model['X_test'], model['y_test']
+            test_data = pd.concat([X_test, y_test], axis=1)
+            test_csv = test_data.to_csv(index=False)
+            zf.writestr(f"data_model_{i+1}_test.csv", test_csv)
+
+            # Save the trained model using joblib -> to bytes, then add to zip
+            model_buffer = BytesIO()
+            joblib.dump(model['Best Estimator'], model_buffer)
+            model_buffer.seek(0)
+            zf.writestr(f"model_{i+1}.joblib", model_buffer.read())
+
+    zip_buffer.seek(0)
+    return zip_buffer
+
+# -----------------------------------------------------------------------------
+# 2. Build the Streamlit Interface
+# -----------------------------------------------------------------------------
 
 def main():
-    st.title("Simple Linear Model Training Demo")
-    st.write("Upload your dataset and specify the target column. We'll do the rest!")
+    st.title("Automated Linear Model Builder")
+    st.write(
+        """
+        This application allows you to:
+        1. Upload a dataset (CSV or XLSX).
+        2. Define the target column.
+        3. Adjust thresholds (Correlation, VIF, Adjusted R², etc.).
+        4. Select the minimum and maximum number of features.
+        5. Train and select the best models.
+        6. Download results in a zipped file.
+        """
+    )
 
-    # File uploader
-    uploaded_file = st.file_uploader("Upload Excel File", type=["xlsx", "xls"])
+    # Sidebar for parameters
+    st.sidebar.header("Parameters & Thresholds")
+    corr_threshold = st.sidebar.number_input("Correlation Threshold (remove features above this correlation):",
+                                             value=0.85, min_value=0.0, max_value=1.0, step=0.01)
+    vif_threshold = st.sidebar.number_input("VIF Threshold:", value=5.0, min_value=1.0, max_value=100.0, step=1.0)
+    adjusted_r2_threshold = st.sidebar.number_input("Minimum Adjusted R² Threshold:", 
+                                                    value=0.3, min_value=0.0, max_value=1.0, step=0.01)
+    cv_r2_threshold = st.sidebar.number_input("Minimum Cross-Validated R² Threshold:", 
+                                              value=0.5, min_value=0.0, max_value=1.0, step=0.01)
+    min_features = st.sidebar.number_input("Minimum Number of Features:", value=3, min_value=1, step=1)
+    max_features = st.sidebar.number_input("Maximum Number of Features:", value=5, min_value=1, step=1)
+    max_models = st.sidebar.number_input("Maximum Number of Models to Output:", value=10, min_value=1, step=1)
 
-    # Text input for target column
-    target_column = st.text_input("Target Column", value="pic50")
+    st.subheader("Upload Your Dataset")
+    uploaded_file = st.file_uploader("Choose a CSV or XLSX file", type=["csv", "xlsx"])
 
-    # Only run if a file is uploaded
-    if uploaded_file and target_column:
-        if st.button("Train Models"):
-            # Read DataFrame from the uploaded Excel file
-            df = pd.read_excel(uploaded_file)
-            
-            # Load and clean data
-            X, y = load_and_clean_data(df, target_column=target_column)
-            if y is None:
-                st.error(f"Target column '{target_column}' not found or not numeric.")
-                return
-            
-            # Remove highly correlated features globally
-            X_reduced = remove_highly_correlated_features(X, threshold=0.85)
-            
-            # Remove features based on VIF
-            X_selected = select_features_via_vif(X_reduced, threshold=5.0)
-
-            # Define models
-            models = {
-                'LinearRegression': LinearRegression(),
-                'Ridge': Ridge(random_state=42),
-                'Lasso': Lasso(random_state=42)
-            }
-
-            param_grids = {
-                'LinearRegression': get_param_grid('LinearRegression'),
-                'Ridge': get_param_grid('Ridge'),
-                'Lasso': get_param_grid('Lasso')
-            }
-
-            # Train & select
-            best_models = train_and_select_models(
-                X_selected, y, 
-                models=models, 
-                param_grids=param_grids,
-                # Using fixed thresholds for simplicity:
-                corr_threshold=0.85,
-                vif_threshold=5.0,
-                adjusted_r2_threshold=0.5,
-                cv_r2_threshold=0.6,
-                min_features=3,
-                max_features=5,
-                max_models=5
-            )
-
-            if not best_models:
-                st.warning("No models met the criteria!")
+    if uploaded_file is not None:
+        # Let user specify the target column
+        file_extension = uploaded_file.name.split('.')[-1].lower()
+        try:
+            if file_extension == 'csv':
+                df = pd.read_csv(uploaded_file)
+            elif file_extension == 'xlsx':
+                df = pd.read_excel(uploaded_file)
             else:
-                st.success(f"Found {len(best_models)} models meeting the criteria.")
-                
-                # Display the top model info
-                top_model = best_models[0]
-                st.write("### Best Model Summary")
-                st.write(f"**Model:** {top_model['Model']}")
-                st.write(f"**Features:** {top_model['Features']}")
-                st.write(f"**Best Params:** {top_model['Best Params']}")
-                st.write(f"**CV R²:** {top_model['Metrics']['CV_R2']:.3f}")
-                st.write(f"**Equation:** {top_model['Metrics']['Equation']}")
-                
-                # Let the user download all best models as a ZIP
-                zip_buffer = io.BytesIO()
-                with zipfile.ZipFile(zip_buffer, "w") as zf:
-                    # 1) Write a summary text
-                    summary_text = io.StringIO()
-                    for i, bm in enumerate(best_models):
-                        summary_text.write(f"Model {i+1}\n")
-                        summary_text.write(f"  Name: {bm['Model']}\n")
-                        summary_text.write(f"  Features: {bm['Features']}\n")
-                        summary_text.write(f"  Best Params: {bm['Best Params']}\n")
-                        summary_text.write(f"  CV R²: {bm['Metrics']['CV_R2']:.4f}\n")
-                        summary_text.write(f"  Equation: {bm['Metrics']['Equation']}\n\n")
-                    zf.writestr("best_models_summary.txt", summary_text.getvalue())
+                st.error("Unsupported file format! Please upload a CSV or XLSX.")
+                return
+
+            st.write("Data preview:")
+            st.dataframe(df.head())
+
+            all_columns = df.columns.tolist()
+            target_column = st.selectbox("Select Target Column", all_columns, index=len(all_columns)-1)
+
+            # Let user specify which columns to exclude if needed
+            st.write("If you have columns to exclude (e.g., ID columns, or columns with 'N°'), select them below.")
+            exclude_columns = st.multiselect("Exclude Columns", options=all_columns, default=[])
+
+            # Button to run the process
+            if st.button("Train Models"):
+                with st.spinner("Processing... This may take a while depending on data size."):
+                    # 1) Load and clean data
+                    X, y = load_and_clean_data(df, target_column=target_column, exclude_columns=exclude_columns)
                     
-                    # 2) For each best model, save train/test CSV + joblib
-                    for i, bm in enumerate(best_models):
-                        X_train = bm['X_train']
-                        y_train = bm['y_train']
-                        train_df = pd.concat([X_train, y_train], axis=1)
-                        zf.writestr(f"model_{i+1}_train.csv", train_df.to_csv(index=False))
+                    # 2) Remove highly correlated features
+                    X_reduced = remove_highly_correlated_features(X, threshold=corr_threshold)
 
-                        X_test = bm['X_test']
-                        y_test = bm['y_test']
-                        test_df = pd.concat([X_test, y_test], axis=1)
-                        zf.writestr(f"model_{i+1}_test.csv", test_df.to_csv(index=False))
+                    # 3) Further feature selection via VIF
+                    X_selected = select_features_via_vif(X_reduced, threshold=vif_threshold)
 
-                        model_bytes = io.BytesIO()
-                        joblib.dump(bm['Best Estimator'], model_bytes)
-                        zf.writestr(f"model_{i+1}.joblib", model_bytes.getvalue())
-                
-                st.download_button(
-                    label="Download Best Models (ZIP)",
-                    data=zip_buffer.getvalue(),
-                    file_name="best_models.zip",
-                    mime="application/zip"
-                )
+                    # 4) Define models
+                    models = {
+                        'LinearRegression': LinearRegression(),
+                        'Ridge': Ridge(random_state=42),
+                        'Lasso': Lasso(random_state=42)
+                    }
+
+                    # 5) Define parameter grids
+                    param_grids = {
+                        'LinearRegression': get_param_grid('LinearRegression'),
+                        'Ridge': get_param_grid('Ridge'),
+                        'Lasso': get_param_grid('Lasso')
+                    }
+
+                    # 6) Train and select best models
+                    best_models = train_and_select_models(
+                        X_selected, y, models, param_grids,
+                        min_features=min_features, max_features=max_features,
+                        vif_threshold=vif_threshold,
+                        adjusted_r2_threshold=adjusted_r2_threshold,
+                        cv_r2_threshold=cv_r2_threshold,
+                        max_models=max_models
+                    )
+
+                    if not best_models:
+                        st.warning("No models met the specified criteria. Try adjusting the thresholds.")
+                    else:
+                        st.success(f"Found {len(best_models)} models meeting the criteria.")
+
+                        # Display top model
+                        top_model = best_models[0]
+                        st.write("### Best Model Summary:")
+                        st.write(f"**Model:** {top_model['Model']}")
+                        st.write(f"**Features:** {top_model['Features']}")
+                        st.write(f"**R² (Test):** {top_model['R2_test']:.4f}")
+                        st.write(f"**Adjusted R² (Test):** {top_model['Adjusted_R2']:.4f}")
+                        st.write(f"**CV R²:** {top_model['CV_R2']:.4f}")
+                        st.write(f"**Equation:** {top_model['Equation']}")
+
+                        # Prepare ZIP for download
+                        zip_buffer = save_model_details_to_zip(best_models)
+                        
+                        st.download_button(
+                            label="Download Results (ZIP)",
+                            data=zip_buffer,
+                            file_name="model_results.zip",
+                            mime="application/zip"
+                        )
+
+    else:
+        st.info("Please upload a CSV or XLSX file to begin.")
 
 if __name__ == "__main__":
     main()
